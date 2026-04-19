@@ -4,8 +4,9 @@
 #include "esp_log.h"
 #include "esp_adc/adc_continuous.h"
 #include "esp_adc/adc_oneshot.h"
-//#include "uart_data.h"
+#include "esp_task_wdt.h"
 #include "fft_calc.h"
+#include "esp_timer.h"
 
 #define TAG "SAMPLER_ESP32S3"
 
@@ -13,14 +14,15 @@
 #define ADC_CHANNEL ADC_CHANNEL_0
 
 #define NUM_SAMPLES 1024
-#define MAX_SAMPLE_RATE 44100.0f
+#define MAX_SAMPLE_RATE 20000.0f
 #define SAMPLE_RATE MAX_SAMPLE_RATE
-#define MIN_BLOCKING_SAMPLE_RATE 1000.0f
+#define MIN_BLOCKING_SAMPLE_RATE 100.0f
 
 adc_oneshot_unit_handle_t adc_handle = NULL;
 
-static float sample_freq = 50.0f; //MAX_SAMPLE_RATE;
+static float sample_freq = 200.0f; //MAX_SAMPLE_RATE;
 static float max_freq = 0.0f;
+static float actual_freq = 0.0f;
 
 TaskHandle_t xFFTTaskHandle = NULL;
 
@@ -30,20 +32,35 @@ static int read_buffer[NUM_SAMPLES];
 
 void vAdaptiveAnalogSamplerTask(void *args) {
     for (;;) {
-        float freq = sample_freq > 1000.0f ? MIN_BLOCKING_SAMPLE_RATE : sample_freq;
+        float freq = sample_freq;
         static int temp_buf[NUM_SAMPLES];
+
         if (freq > MIN_BLOCKING_SAMPLE_RATE) {
-            //TODO usare esp_rom_blocking_delay_us() per campionare a frequenze più alte senza bloccare il task
-        } else {
-            int delay_ticks = (int) 1000 / freq; // Adaptive delay
-            TickType_t xLastWakeTime = xTaskGetTickCount();
+            uint32_t delay_us = (uint32_t)(1000000.0f / freq);
+
+            uint64_t start_time = esp_timer_get_time();
 
             for (int i = 0; i < NUM_SAMPLES; i++) {
                 int raw_value;
                 ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
                 temp_buf[i] = (int) raw_value;
 
-                printf(">signal: %d\n", temp_buf[i]); //just for debugging
+                esp_rom_delay_us(delay_us);
+            }
+
+            uint64_t end_time = esp_timer_get_time();
+            actual_freq = (1000000.0f * NUM_SAMPLES) / (float)(end_time - start_time);
+
+            esp_task_wdt_reset();
+        } else {
+            int delay_ticks = (int) 1000 / freq; // Adaptive delay
+            actual_freq = 1000.0f / delay_ticks;
+            TickType_t xLastWakeTime = xTaskGetTickCount();
+
+            for (int i = 0; i < NUM_SAMPLES; i++) {
+                int raw_value;
+                ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
+                temp_buf[i] = (int) raw_value;
                 
                 xTaskDelayUntil(&xLastWakeTime, delay_ticks);
             }
@@ -51,6 +68,7 @@ void vAdaptiveAnalogSamplerTask(void *args) {
 
         for (int i = 0; i < NUM_SAMPLES; i++) {
             read_buffer[i] = temp_buf[i];
+            printf(">signal: %d\n", temp_buf[i]); //just for debugging
         }
 
         xTaskNotifyGive(xFFTTaskHandle);
@@ -63,7 +81,7 @@ void vFFTTask(void *args) {
     for(;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        float ret = process_fft(read_buffer, NUM_SAMPLES, sample_freq, &max_power, &highest_freq);
+        float ret = process_fft(read_buffer, NUM_SAMPLES, actual_freq, &max_power, &highest_freq);
 
         ESP_LOGI(TAG, "<FFT> Max Power on frequency: %.2f Hz\n",ret);
         ESP_LOGI(TAG, "<FFT> Highest Frequency: %.2f Hz\n",highest_freq);
@@ -73,6 +91,10 @@ void vFFTTask(void *args) {
         if (highest_freq > max_freq) {
             max_freq = highest_freq;
             sample_freq = (max_freq * 2) + 1.0f;
+        }
+
+        if (sample_freq > MAX_SAMPLE_RATE) {
+            sample_freq = MAX_SAMPLE_RATE;
         }
         
     }
