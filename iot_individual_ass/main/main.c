@@ -46,23 +46,8 @@ TaskHandle_t xAggregatorTaskHandle = NULL;
 static int read_buffer[NUM_SAMPLES];
 static portMUX_TYPE g_data_mux = portMUX_INITIALIZER_UNLOCKED;
 
-typedef struct {
-    float dominant_freq;
-    float max_power;
-    float highest_freq;
-} audio_data_t;
-
-typedef struct {
-    float execution_time;
-    float sampled_freq;
-    float sample_number;
-    int* samples;
-} sample_data_t;
-
 QueueHandle_t mqtt_queue = NULL;
 QueueHandle_t data_queue = NULL;
-
-
 
 void vAdaptiveAnalogSamplerTask(void *args) {
     uint64_t start_time, end_time, execution_time;
@@ -139,7 +124,7 @@ void vAdaptiveAnalogSamplerTask(void *args) {
 }
 
 void vAggregatorTask(void *args) {
-    int local_samples[NUM_SAMPLES];
+    float avg = 0.0f;
     sample_data_t rcv_data;
 
     for(;;) {
@@ -148,10 +133,20 @@ void vAggregatorTask(void *args) {
         ESP_LOGI(TAG, "<Aggregator> Received data\n");
 
         for (int i = 0; i < NUM_SAMPLES; i++) {
-            local_samples[i] = rcv_data.samples[i];
+            avg += rcv_data.samples[i];
         }
+        avg /= NUM_SAMPLES;
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        aggregated_data_t data_to_send = {
+            .average = avg,
+            .execution_time = rcv_data.execution_time,
+            .sampled_freq = rcv_data.sampled_freq,
+            .sample_number = rcv_data.sample_number
+        };
+
+        if (mqtt_queue != NULL) {
+            xQueueSend(mqtt_queue, &data_to_send, pdMS_TO_TICKS(100));
+        }
     }
 }
 
@@ -222,16 +217,6 @@ void vFFTTask(void *args) {
         taskEXIT_CRITICAL(&g_data_mux);
 
         ESP_LOGI(TAG, "Adattamento frequenza di campionamento a: %.2f Hz\n", new_sample_freq);
-
-        audio_data_t data_to_send = {
-            .dominant_freq = ret,
-            .max_power = max_power,
-            .highest_freq = highest_freq
-        };
-
-        if (mqtt_queue != NULL) {
-            xQueueSend(mqtt_queue, &data_to_send, pdMS_TO_TICKS(100));
-        }
         
     }
 }
@@ -359,7 +344,7 @@ static void aws_iot_mqtt_init(void) {
 }
 
 void vMQTTPublishTask(void *args) {
-    audio_data_t data_to_send;
+    aggregated_data_t data_to_send;
     char json_payload[128];
 
     // Aspettiamo un attimo che il Wi-Fi e MQTT si assestino
@@ -371,12 +356,11 @@ void vMQTTPublishTask(void *args) {
             
             // Creiamo il pacchetto JSON (uguale a quello che faresti in Arduino)
             snprintf(json_payload, sizeof(json_payload), 
-                     "{\"dom_freq\":%.2f, \"high_freq\":%.2f, \"power\":%.0f}", 
-                     data_to_send.dominant_freq, data_to_send.highest_freq, data_to_send.max_power);
+                     "{\"average\":%.2f, \"execution_time\":%.2f, \"sampled_freq\":%.2f, \"sample_number\":%d}", 
+                     data_to_send.average, data_to_send.execution_time, data_to_send.sampled_freq, data_to_send.sample_number);
             
-            // Invio ad AWS IoT Core (Topic: esp32/pub, QoS: 0, Retain: 0)
             if (mqtt_client != NULL) {
-                esp_mqtt_client_publish(mqtt_client, "esp32/pub", json_payload, 0, 0, 0);
+                esp_mqtt_client_publish(mqtt_client, "esp32/data", json_payload, 0, 0, 0);
                 ESP_LOGI("AWS_MQTT", "Pubblicato: %s", json_payload);
             }
         }
