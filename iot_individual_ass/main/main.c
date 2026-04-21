@@ -15,6 +15,7 @@
 #include "mqtt_client.h"
 #include "esp_sntp.h"
 #include <time.h>
+#include "setup.h"
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
@@ -54,6 +55,7 @@ QueueHandle_t mqtt_queue = NULL;
 
 
 void vAdaptiveAnalogSamplerTask(void *args) {
+    uint64_t start_time, end_time;
     for (;;) {
         float freq = MAX_SAMPLE_RATE;
         static int temp_buf[NUM_SAMPLES];
@@ -66,7 +68,7 @@ void vAdaptiveAnalogSamplerTask(void *args) {
         if (freq > MIN_BLOCKING_SAMPLE_RATE) {
             uint32_t delay_us = (uint32_t)(1000000.0f / freq);
 
-            uint64_t start_time = esp_timer_get_time();
+            start_time = esp_timer_get_time();
 
             for (int i = 0; i < NUM_SAMPLES; i++) {
                 int raw_value;
@@ -80,20 +82,19 @@ void vAdaptiveAnalogSamplerTask(void *args) {
                 }
             }
 
-            uint64_t end_time = esp_timer_get_time();
+            end_time = esp_timer_get_time();
             sampled_freq = (1000000.0f * NUM_SAMPLES) / (float)(end_time - start_time);
-
-            ESP_LOGI(TAG, "Campionamento a frequenza: %.2f Hz (Bloccante), con tempo di esecuzione: %" PRIu64 " us\n", sampled_freq, end_time - start_time);
 
         } else {
             TickType_t delay_ticks = pdMS_TO_TICKS((uint32_t)(1000.0f / freq));
-            if (delay_ticks < 1) {
-                delay_ticks = 1;
+            if (delay_ticks < 10) {
+                delay_ticks = 10;
             }
 
             sampled_freq = 1000.0f / (float)delay_ticks;
             TickType_t xLastWakeTime = xTaskGetTickCount();
 
+            start_time = esp_timer_get_time();
             for (int i = 0; i < NUM_SAMPLES; i++) {
                 int raw_value;
                 ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
@@ -101,9 +102,10 @@ void vAdaptiveAnalogSamplerTask(void *args) {
                 
                 xTaskDelayUntil(&xLastWakeTime, delay_ticks);
             }
-
-            ESP_LOGI(TAG, "Campionamento a frequenza: %.2f Hz (Non Bloccante), con delay di: %lu tick\n", sampled_freq, (unsigned long)delay_ticks);
+            end_time = esp_timer_get_time();
         }
+        
+        ESP_LOGI(TAG, "<Sampler> Sampling frequency: %.2f Hz\nExecution time: %" PRIu64 " us\n", sampled_freq, end_time - start_time);
 
         taskENTER_CRITICAL(&g_data_mux);
         for (int i = 0; i < NUM_SAMPLES; i++) {
@@ -116,6 +118,38 @@ void vAdaptiveAnalogSamplerTask(void *args) {
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+void vFastSampler(void *args) {
+    uint64_t start_time = esp_timer_get_time();
+
+    int i = 0;
+    while (esp_timer_get_time() - start_time < 1000000) {
+        int raw_value;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
+        i++;
+    }
+    uint64_t execution_time = esp_timer_get_time() - start_time;
+
+    ESP_LOGI(TAG, "<FastSampler> Completed Operation in: %" PRIu64 " us\nSample number: %d\nAverage frequency: %.2f Hz", execution_time, i, (float) i * 1000000.0f / (float) execution_time);
+
+    uint64_t sample_time[100];
+    for (int j = 0; j < 100; j++) {
+        uint64_t start_sample_time = esp_timer_get_time();
+        int raw_value;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
+        sample_time[j] = esp_timer_get_time() - start_sample_time;
+    }
+
+    uint64_t avg_oneshot_time = 0;
+    for (int k = 0; k < 100; k++) {
+        avg_oneshot_time += sample_time[k];
+    }
+    avg_oneshot_time /= 100;
+
+    ESP_LOGI(TAG, "<FastSampler> Average time per adc_oneshot_read: %" PRIu64 " us\n", avg_oneshot_time);
+
+    for(;;) {vTaskDelay(pdMS_TO_TICKS(1000));}
 }
 
 void vFFTTask(void *args) {
@@ -315,41 +349,55 @@ void vMQTTPublishTask(void *args) {
 }
 
 void app_main(void) {
-    
-    esp_err_t err_ret = nvs_flash_init();
-    if (err_ret == ESP_ERR_NVS_NO_FREE_PAGES || err_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err_ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err_ret);
-
-    init_adc_oneshot();
-    init_fft(NUM_SAMPLES);
-
-    wifi_init_sta();
-    sync_time();
-    aws_iot_mqtt_init();
-
-    mqtt_queue = xQueueCreate(10, sizeof(audio_data_t));
-
     BaseType_t ret;
 
-    ret = xTaskCreatePinnedToCore(vAdaptiveAnalogSamplerTask, "Sampler", 4096, NULL, 5, NULL, 1);
+    init_adc_oneshot();
 
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "SETUP: <Impossibile creare il task Sampler>\n");
+    if (MODE == DEMO) {
+        esp_err_t err_ret = nvs_flash_init();
+        if (err_ret == ESP_ERR_NVS_NO_FREE_PAGES || err_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            err_ret = nvs_flash_init();
+        }
+        ESP_ERROR_CHECK(err_ret);
+        
+        init_fft(NUM_SAMPLES);
+
+        wifi_init_sta();
+        sync_time();
+        aws_iot_mqtt_init();
+
+        mqtt_queue = xQueueCreate(10, sizeof(audio_data_t));
+
+        ret = xTaskCreatePinnedToCore(vAdaptiveAnalogSamplerTask, "Sampler", 4096, NULL, 5, NULL, 1);
+
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task Sampler>\n");
+        }
+
+        ret = xTaskCreatePinnedToCore(vFFTTask, "FFT", 8192, NULL, 5, &xFFTTaskHandle, 0);
+
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task FFT>\n");
+        }
+
+        ret = xTaskCreatePinnedToCore(vMQTTPublishTask, "MQTTPublish", 4096, NULL, 5, NULL, 0);
+
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task MQTTPublish>\n");
+        }
     }
 
-    ret = xTaskCreatePinnedToCore(vFFTTask, "FFT", 8192, NULL, 5, &xFFTTaskHandle, 0);
+    else if (MODE == FAST_SAMPLER) {
+        ESP_LOGI(TAG, "<SETUP>: Starting FastSampler Task for testing ADC performance");
 
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "SETUP: <Impossibile creare il task FFT>\n");
-    }
+        ret = xTaskCreatePinnedToCore(vFastSampler, "FastSampler", 4096, NULL, 1, NULL, 1);
 
-    ret = xTaskCreatePinnedToCore(vMQTTPublishTask, "MQTTPublish", 4096, NULL, 5, NULL, 0);
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task FastSampler>\n");
+        }
 
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "SETUP: <Impossibile creare il task MQTTPublish>\n");
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
 }
