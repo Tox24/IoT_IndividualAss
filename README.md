@@ -46,6 +46,6 @@ $$adaptive\_sampling\_freq = highest\_freq * 5.0$$
 
 to prevent data loss and to get a good reconstruction of the signal.
 
-
+![FFT Task Screenshot](assets/FFT_task_screen.png)
 
 ## Bonuses

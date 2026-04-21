@@ -33,6 +33,7 @@ static int s_retry_num = 0;
 #define MAX_SAMPLE_RATE 20000.0f
 #define MIN_BLOCKING_SAMPLE_RATE 100.0f
 #define MIN_SAMPLE_RATE 50.0f
+#define S_TO_muS 1000000.0f
 
 adc_oneshot_unit_handle_t adc_handle = NULL;
 
@@ -40,6 +41,7 @@ static volatile float sample_freq = MAX_SAMPLE_RATE;
 static volatile float actual_freq = 0.0f;
 
 TaskHandle_t xFFTTaskHandle = NULL;
+TaskHandle_t xAggregatorTaskHandle = NULL;
 
 static int read_buffer[NUM_SAMPLES];
 static portMUX_TYPE g_data_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -50,12 +52,21 @@ typedef struct {
     float highest_freq;
 } audio_data_t;
 
+typedef struct {
+    float execution_time;
+    float sampled_freq;
+    float sample_number;
+    int* samples;
+} sample_data_t;
+
 QueueHandle_t mqtt_queue = NULL;
+QueueHandle_t data_queue = NULL;
 
 
 
 void vAdaptiveAnalogSamplerTask(void *args) {
-    uint64_t start_time, end_time;
+    uint64_t start_time, end_time, execution_time;
+    
     for (;;) {
         float freq = MAX_SAMPLE_RATE;
         static int temp_buf[NUM_SAMPLES];
@@ -66,10 +77,9 @@ void vAdaptiveAnalogSamplerTask(void *args) {
         taskEXIT_CRITICAL(&g_data_mux);
 
         if (freq > MIN_BLOCKING_SAMPLE_RATE) {
-            uint32_t delay_us = (uint32_t)(1000000.0f / freq);
+            uint32_t delay_us = (uint32_t)(S_TO_muS / freq);
 
             start_time = esp_timer_get_time();
-
             for (int i = 0; i < NUM_SAMPLES; i++) {
                 int raw_value;
                 ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
@@ -81,9 +91,7 @@ void vAdaptiveAnalogSamplerTask(void *args) {
                     esp_rom_delay_us(delay_us);
                 }
             }
-
             end_time = esp_timer_get_time();
-            sampled_freq = (1000000.0f * NUM_SAMPLES) / (float)(end_time - start_time);
 
         } else {
             TickType_t delay_ticks = pdMS_TO_TICKS((uint32_t)(1000.0f / freq));
@@ -91,7 +99,6 @@ void vAdaptiveAnalogSamplerTask(void *args) {
                 delay_ticks = 10;
             }
 
-            sampled_freq = 1000.0f / (float)delay_ticks;
             TickType_t xLastWakeTime = xTaskGetTickCount();
 
             start_time = esp_timer_get_time();
@@ -105,7 +112,10 @@ void vAdaptiveAnalogSamplerTask(void *args) {
             end_time = esp_timer_get_time();
         }
         
-        ESP_LOGI(TAG, "<Sampler> Sampling frequency: %.2f Hz\nExecution time: %" PRIu64 " us\n", sampled_freq, end_time - start_time);
+        execution_time = end_time - start_time;
+        sampled_freq = (S_TO_muS * NUM_SAMPLES) / (float)(end_time - start_time);
+        
+        ESP_LOGI(TAG, "<Sampler> Sampling frequency: %.2f Hz\nExecution time: %" PRIu64 " us\n", sampled_freq, execution_time);
 
         taskENTER_CRITICAL(&g_data_mux);
         for (int i = 0; i < NUM_SAMPLES; i++) {
@@ -115,8 +125,33 @@ void vAdaptiveAnalogSamplerTask(void *args) {
         taskEXIT_CRITICAL(&g_data_mux);
 
         xTaskNotifyGive(xFFTTaskHandle);
+        
+        sample_data_t data_to_send = {
+            .execution_time = (float) execution_time,
+            .sampled_freq = sampled_freq,
+            .sample_number = NUM_SAMPLES,
+            .samples = read_buffer
+        };
+        xQueueSend(data_queue, &data_to_send, pdMS_TO_TICKS(100));
 
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void vAggregatorTask(void *args) {
+    int local_samples[NUM_SAMPLES];
+    sample_data_t rcv_data;
+
+    for(;;) {
+        xQueueReceive(data_queue, &rcv_data, portMAX_DELAY);
+        
+        ESP_LOGI(TAG, "<Aggregator> Received data\n");
+
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            local_samples[i] = rcv_data.samples[i];
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -369,23 +404,32 @@ void app_main(void) {
 
         mqtt_queue = xQueueCreate(10, sizeof(audio_data_t));
 
+        data_queue = xQueueCreate(1, sizeof(sample_data_t));
+
         ret = xTaskCreatePinnedToCore(vAdaptiveAnalogSamplerTask, "Sampler", 4096, NULL, 5, NULL, 1);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task Sampler>\n");
+            ESP_LOGE(TAG, "SETUP: <Error on starting Sampler task>\n");
         }
 
         ret = xTaskCreatePinnedToCore(vFFTTask, "FFT", 8192, NULL, 5, &xFFTTaskHandle, 0);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task FFT>\n");
+            ESP_LOGE(TAG, "SETUP: <Error on starting FFT task>\n");
+        }
+
+        ret = xTaskCreatePinnedToCore(vAggregatorTask, "Aggregator", 8192, NULL, 5, &xAggregatorTaskHandle, 0);
+
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "SETUP: <Error on starting Aggregator task>\n");
         }
 
         ret = xTaskCreatePinnedToCore(vMQTTPublishTask, "MQTTPublish", 4096, NULL, 5, NULL, 0);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task MQTTPublish>\n");
+            ESP_LOGE(TAG, "SETUP: <Error on starting MQTTPublish task>\n");
         }
+
     }
 
     else if (MODE == FAST_SAMPLER) {
@@ -394,7 +438,7 @@ void app_main(void) {
         ret = xTaskCreatePinnedToCore(vFastSampler, "FastSampler", 4096, NULL, 1, NULL, 1);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Impossibile creare il task FastSampler>\n");
+            ESP_LOGE(TAG, "SETUP: <Error on starting FastSampler task>\n");
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));

@@ -5,4 +5,4 @@ typedef enum {
     FAST_SAMPLER
 } code_personal_mode_t;
 
-code_personal_mode_t MODE = FAST_SAMPLER;
+code_personal_mode_t MODE = DEMO;
