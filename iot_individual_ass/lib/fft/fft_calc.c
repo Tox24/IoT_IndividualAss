@@ -2,114 +2,154 @@
 #include "esp_dsp.h"
 #include "esp_log.h"
 #include <math.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 static const char *TAG = "FFT_LIB";
 
-// Puntatori globali allocati una sola volta all'avvio (Risolto il Memory Leak!)
-static float *fft_data;
-static float *hanning_window;
+static float *fft_data = NULL;
+static float *hanning_window = NULL;
+static int fft_size = 0;
+static bool fft_ready = false;
+
+static bool is_power_of_two(int value) {
+    return (value > 0) && ((value & (value - 1)) == 0);
+}
+
+static void release_fft_buffers(void) {
+    if (fft_data) {
+        free(fft_data);
+        fft_data = NULL;
+    }
+    if (hanning_window) {
+        free(hanning_window);
+        hanning_window = NULL;
+    }
+    fft_size = 0;
+    fft_ready = false;
+}
 
 void init_fft(int FFT_SAMPLES) {
+    if (!is_power_of_two(FFT_SAMPLES)) {
+        ESP_LOGE(TAG, "FFT_SAMPLES deve essere una potenza di 2 (valore: %d)", FFT_SAMPLES);
+        return;
+    }
+
     esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Errore inizializzazione FFT");
+        return;
     }
-    
-    // Allocazione della finestra di Hanning
-    hanning_window = (float *)malloc(FFT_SAMPLES * sizeof(float));
+
+    if (fft_size != FFT_SAMPLES) {
+        release_fft_buffers();
+    }
+
+    if (hanning_window == NULL) {
+        hanning_window = (float *)malloc((size_t)FFT_SAMPLES * sizeof(float));
+    }
     if (!hanning_window) {
         ESP_LOGE(TAG, "Errore nell'allocazione della finestra di Hanning");
+        release_fft_buffers();
         return;
     }
     dsps_wind_hann_f32(hanning_window, FFT_SAMPLES);
-    
-    // Allocazione del buffer di calcolo per la FFT (Dimensione doppia per i numeri complessi)
-    fft_data = (float *)malloc(FFT_SAMPLES * 2 * sizeof(float));
+
+    if (fft_data == NULL) {
+        fft_data = (float *)malloc((size_t)FFT_SAMPLES * 2U * sizeof(float));
+    }
     if (!fft_data) {
         ESP_LOGE(TAG, "Errore nell'allocazione dei dati FFT");
+        release_fft_buffers();
         return;
     }
+
+    fft_size = FFT_SAMPLES;
+    fft_ready = true;
 
     ESP_LOGI(TAG, "Modulo FFT pronto (%d campioni)", FFT_SAMPLES);
 }
 
 
 float process_fft(int *samples, int FFT_SAMPLES, float current_sample_rate, float *max_power, float *highest_freq) {
-    
-    // ==========================================
-    // 1. RIMOZIONE DC OFFSET (Centratura dell'onda)
-    // ==========================================
-    long sum = 0;
-    for (int i = 0; i < FFT_SAMPLES; i++) {
+    if (max_power) {
+        *max_power = 0.0f;
+    }
+    if (highest_freq) {
+        *highest_freq = 0.0f;
+    }
+
+    if (!samples || current_sample_rate <= 0.0f || FFT_SAMPLES <= 0 || !is_power_of_two(FFT_SAMPLES)) {
+        ESP_LOGE(TAG, "Parametri FFT non validi");
+        return 0.0f;
+    }
+
+    if (!fft_ready || fft_size != FFT_SAMPLES || !fft_data || !hanning_window) {
+        ESP_LOGE(TAG, "FFT non inizializzata o dimensione incoerente. Richiesto init_fft(%d)", FFT_SAMPLES);
+        return 0.0f;
+    }
+
+    int64_t sum = 0;
+    for (int i = 0; i < FFT_SAMPLES; ++i) {
         sum += samples[i];
     }
-    float mean = (float)sum / (float)FFT_SAMPLES; 
+    const float mean = (float)sum / (float)FFT_SAMPLES;
 
-    // ==========================================
-    // 2. PREPARAZIONE DEI DATI COMPLESSI
-    // ==========================================
-    for (int i = 0; i < FFT_SAMPLES; i++) {
-        // Sottraggo la media per togliere il "finto zero" (es. 1.65V)
-        float centered_sample = (float)samples[i] - mean; 
-        
-        // Assegno il valore reale (moltiplicato per la finestra di Hanning)
+    for (int i = 0; i < FFT_SAMPLES; ++i) {
+        const float centered_sample = (float)samples[i] - mean;
         fft_data[i * 2 + 0] = centered_sample * hanning_window[i];
-        // Assegno zero alla parte immaginaria
         fft_data[i * 2 + 1] = 0.0f;
     }
-    
-    // ==========================================
-    // 3. ESECUZIONE FFT
-    // ==========================================
+
     dsps_fft2r_fc32(fft_data, FFT_SAMPLES);
     dsps_bit_rev_fc32(fft_data, FFT_SAMPLES);
-    // (dsps_cplx2reC_fc32 rimossa per evitare corruzione dei dati)
 
-    // ==========================================
-    // 4. RICERCA DEL PICCO TRAMITE MAGNITUDO
-    // ==========================================
-    float power = 0;
+    float peak_mag_sq = 0.0f;
+    float mean_mag_sq = 0.0f;
     int peak_index = 0;
-    int highest_index = 0;
+    const int half_spectrum = FFT_SAMPLES / 2;
     
-    // Soglia di rumore alzata per evitare falsi positivi
-    float NOISE_THRESHOLD = 50000.0f; 
+    for (int i = 1; i < half_spectrum; ++i) {
+        const float re = fft_data[i * 2 + 0];
+        const float im = fft_data[i * 2 + 1];
+        const float mag_sq = (re * re) + (im * im);
+        mean_mag_sq += mag_sq;
 
-    // Partiamo da 1 per saltare comunque il bin 0 (ulteriore sicurezza contro residui DC)
-    for (int i = 1; i < FFT_SAMPLES / 2; i++) {
-        
-        // Estraggo Parte Reale e Parte Immaginaria
-        float re = fft_data[i * 2 + 0];
-        float im = fft_data[i * 2 + 1];
-        
-        // Teorema di Pitagora per l'energia totale (Magnitudo)
-        float magnitude = sqrt((re * re) + (im * im));
-        
-        // A. Cerca la componente Dominante (per l'analisi del segnale)
-        if (magnitude > power) {
-            power = magnitude;
+        if (mag_sq > peak_mag_sq) {
+            peak_mag_sq = mag_sq;
             peak_index = i;
         }
-        
-        // B. Cerca la componente Massima reale (per il Teorema di Nyquist)
-        if (magnitude > NOISE_THRESHOLD) {
+    }
+
+    if (half_spectrum > 1) {
+        mean_mag_sq /= (float)(half_spectrum - 1);
+    }
+
+    const float relative_threshold = peak_mag_sq * 0.1f;
+    const float noise_threshold = mean_mag_sq * 8.0f;
+    const float detection_threshold = fmaxf(relative_threshold, noise_threshold);
+
+    int highest_index = 0;
+
+    for (int i = 1; i < half_spectrum; ++i) {
+        const float re = fft_data[i * 2 + 0];
+        const float im = fft_data[i * 2 + 1];
+        const float mag_sq = (re * re) + (im * im);
+
+        if (mag_sq > detection_threshold) {
             highest_index = i;
         }
     }
 
-    // ==========================================
-    // 5. CALCOLI FINALI
-    // ==========================================
-    float bin_width_hz = current_sample_rate / (float)FFT_SAMPLES;
+    const float bin_width_hz = current_sample_rate / (float)FFT_SAMPLES;
+    const float peak_magnitude = sqrtf(peak_mag_sq);
 
     if (max_power) {
-        *max_power = power;
+        *max_power = peak_magnitude;
     }
     if (highest_freq) {
-        // Questa è la frequenza massima per il tuo algoritmo adattivo
         *highest_freq = (float)highest_index * bin_width_hz;
     }
 
-    // Ritorna la frequenza dominante individuata
     return (float)peak_index * bin_width_hz;
 }

@@ -2,7 +2,7 @@ import numpy as np
 import sounddevice as sd
 
 sps = 44100
-freq_hz = 5
+freq_hz = 50
 duration_s = 60.0
 attenuation = 0.8
 

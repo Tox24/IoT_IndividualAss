@@ -1,12 +1,27 @@
 #include <stdio.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_adc/adc_continuous.h"
 #include "esp_adc/adc_oneshot.h"
-#include "esp_task_wdt.h"
 #include "fft_calc.h"
 #include "esp_timer.h"
+#include "secrets.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "mqtt_client.h"
+#include "esp_sntp.h"
+#include <time.h>
+
+esp_mqtt_client_handle_t mqtt_client = NULL;
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static EventGroupHandle_t s_wifi_event_group;
+static int s_retry_num = 0;
 
 #define TAG "SAMPLER_ESP32S3"
 
@@ -15,25 +30,38 @@
 
 #define NUM_SAMPLES 1024
 #define MAX_SAMPLE_RATE 20000.0f
-#define SAMPLE_RATE MAX_SAMPLE_RATE
 #define MIN_BLOCKING_SAMPLE_RATE 100.0f
+#define MIN_SAMPLE_RATE 50.0f
 
 adc_oneshot_unit_handle_t adc_handle = NULL;
 
-static float sample_freq = 200.0f; //MAX_SAMPLE_RATE;
-static float max_freq = 0.0f;
-static float actual_freq = 0.0f;
+static volatile float sample_freq = MAX_SAMPLE_RATE;
+static volatile float actual_freq = 0.0f;
 
 TaskHandle_t xFFTTaskHandle = NULL;
 
-//static float fft_input[NUM_SAMPLES];
 static int read_buffer[NUM_SAMPLES];
+static portMUX_TYPE g_data_mux = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    float dominant_freq;
+    float max_power;
+    float highest_freq;
+} audio_data_t;
+
+QueueHandle_t mqtt_queue = NULL;
+
 
 
 void vAdaptiveAnalogSamplerTask(void *args) {
     for (;;) {
-        float freq = sample_freq;
+        float freq = MAX_SAMPLE_RATE;
         static int temp_buf[NUM_SAMPLES];
+        float sampled_freq = 0.0f;
+
+        taskENTER_CRITICAL(&g_data_mux);
+        freq = sample_freq;
+        taskEXIT_CRITICAL(&g_data_mux);
 
         if (freq > MIN_BLOCKING_SAMPLE_RATE) {
             uint32_t delay_us = (uint32_t)(1000000.0f / freq);
@@ -45,16 +73,25 @@ void vAdaptiveAnalogSamplerTask(void *args) {
                 ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
                 temp_buf[i] = (int) raw_value;
 
-                esp_rom_delay_us(delay_us);
+                if (i % 300 == 0 && i != 0) {
+                vTaskDelay(1); 
+                } else {
+                    esp_rom_delay_us(delay_us);
+                }
             }
 
             uint64_t end_time = esp_timer_get_time();
-            actual_freq = (1000000.0f * NUM_SAMPLES) / (float)(end_time - start_time);
+            sampled_freq = (1000000.0f * NUM_SAMPLES) / (float)(end_time - start_time);
 
-            esp_task_wdt_reset();
+            ESP_LOGI(TAG, "Campionamento a frequenza: %.2f Hz (Bloccante), con tempo di esecuzione: %" PRIu64 " us\n", sampled_freq, end_time - start_time);
+
         } else {
-            int delay_ticks = (int) 1000 / freq; // Adaptive delay
-            actual_freq = 1000.0f / delay_ticks;
+            TickType_t delay_ticks = pdMS_TO_TICKS((uint32_t)(1000.0f / freq));
+            if (delay_ticks < 1) {
+                delay_ticks = 1;
+            }
+
+            sampled_freq = 1000.0f / (float)delay_ticks;
             TickType_t xLastWakeTime = xTaskGetTickCount();
 
             for (int i = 0; i < NUM_SAMPLES; i++) {
@@ -64,73 +101,71 @@ void vAdaptiveAnalogSamplerTask(void *args) {
                 
                 xTaskDelayUntil(&xLastWakeTime, delay_ticks);
             }
+
+            ESP_LOGI(TAG, "Campionamento a frequenza: %.2f Hz (Non Bloccante), con delay di: %lu tick\n", sampled_freq, (unsigned long)delay_ticks);
         }
 
+        taskENTER_CRITICAL(&g_data_mux);
         for (int i = 0; i < NUM_SAMPLES; i++) {
             read_buffer[i] = temp_buf[i];
-            printf(">signal: %d\n", temp_buf[i]); //just for debugging
         }
+        actual_freq = sampled_freq;
+        taskEXIT_CRITICAL(&g_data_mux);
 
         xTaskNotifyGive(xFFTTaskHandle);
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void vFFTTask(void *args) {
     float max_power, highest_freq;
+    int local_samples[NUM_SAMPLES];
+    float local_sample_rate = 0.0f;
 
     for(;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        float ret = process_fft(read_buffer, NUM_SAMPLES, actual_freq, &max_power, &highest_freq);
+        taskENTER_CRITICAL(&g_data_mux);
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            local_samples[i] = read_buffer[i];
+        }
+        local_sample_rate = actual_freq;
+        taskEXIT_CRITICAL(&g_data_mux);
+
+        float ret = process_fft(local_samples, NUM_SAMPLES, local_sample_rate, &max_power, &highest_freq);
 
         ESP_LOGI(TAG, "<FFT> Max Power on frequency: %.2f Hz\n",ret);
         ESP_LOGI(TAG, "<FFT> Highest Frequency: %.2f Hz\n",highest_freq);
 
-        printf(">frequency: %.2f\n", ret);
+        float new_sample_freq = highest_freq * 5.0f;
 
-        if (highest_freq > max_freq) {
-            max_freq = highest_freq;
-            sample_freq = (max_freq * 2) + 1.0f;
+        if (new_sample_freq < MIN_SAMPLE_RATE) {
+            new_sample_freq = MIN_SAMPLE_RATE;
         }
 
-        if (sample_freq > MAX_SAMPLE_RATE) {
-            sample_freq = MAX_SAMPLE_RATE;
+        if (new_sample_freq > MAX_SAMPLE_RATE) {
+            new_sample_freq = MAX_SAMPLE_RATE;
+        }
+
+        taskENTER_CRITICAL(&g_data_mux);
+        sample_freq = new_sample_freq;
+        taskEXIT_CRITICAL(&g_data_mux);
+
+        ESP_LOGI(TAG, "Adattamento frequenza di campionamento a: %.2f Hz\n", new_sample_freq);
+
+        audio_data_t data_to_send = {
+            .dominant_freq = ret,
+            .max_power = max_power,
+            .highest_freq = highest_freq
+        };
+
+        if (mqtt_queue != NULL) {
+            xQueueSend(mqtt_queue, &data_to_send, pdMS_TO_TICKS(100));
         }
         
     }
 }
-
-/*
-void init_adc_dma() {
-    // 1. Creiamo il "secchio" gigante nella RAM
-    adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 8192,
-        .conv_frame_size = NUM_SAMPLES,
-    };
-    ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
-
-    // 2. Configuriamo il "metronomo" (Pattern)
-    adc_digi_pattern_config_t adc_pattern[1] = {0};
-    adc_pattern[0].atten = ADC_ATTEN_DB_12; // Range 0 - 3.1V (Perfetto per i tuoi 1.65V)
-    adc_pattern[0].channel = ADC_CHANNEL;
-    adc_pattern[0].unit = ADC_UNIT_1;
-    adc_pattern[0].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH; // Massima risoluzione (12 bit)
-
-    // 3. Attiviamo la lettura continua a 44100 Hz
-    adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = SAMPLE_RATE,
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
-        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2, // Formato dati specifico per ESP32-S3
-        .pattern_num = 1,
-        .adc_pattern = adc_pattern,
-    };
-    
-    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
-    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
-    
-    ESP_LOGI(TAG, "ADC DMA Inizializzato a %d Hz sul Canale %d", SAMPLE_RATE, ADC_CHANNEL);
-}
-*/
 
 void init_adc_oneshot() {
     // Inizializziamo l'unità ADC1
@@ -140,29 +175,162 @@ void init_adc_oneshot() {
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
-    // Configuriamo il singolo canale (GPIO 1)
     adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_12, // 4096 valori possibili
-        .atten = ADC_ATTEN_DB_12,    // Range fino a ~3.1V (Perfetto per il tuo 1.65V)
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &config));
     
     ESP_LOGI(TAG, "ADC OneShot Inizializzato");
 }
 
+static void sync_time(void) {
+    ESP_LOGI(TAG, "Inizializzazione SNTP. Sincronizzazione orario in corso...");
+    
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org"); // Server mondiale del tempo
+    esp_sntp_init();
+
+    int retry = 0;
+    const int retry_count = 15;
+    
+    // Aspettiamo finché l'orologio non si aggiorna (massimo 30 secondi)
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        ESP_LOGI(TAG, "In attesa della rete e dell'orario... (%d/%d)", retry, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    
+    // Stampiamo l'ora per essere sicuri
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    ESP_LOGI(TAG, "Orario sincronizzato con successo: %s", asctime(&timeinfo));
+}
+
+static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < 10) { 
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGW(TAG, "Ritento la connessione al Wi-Fi... (%d/10)", s_retry_num);
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "SUCCESSO! Indirizzo IP ottenuto: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG, "Attendiamo che il router ci dia un IP VERO...");
+
+    // Si blocca qui e aspetta l'IP VERO
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Wi-Fi connesso con successo, passiamo al cloud!");
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGE(TAG, "Impossibile connettersi al Wi-Fi. Fermo tutto!");
+        vTaskSuspend(NULL); // Congela la scheda se il Wi-Fi non va
+    }
+}
+
+static void aws_iot_mqtt_init(void) {
+    // Configurazione ESP-IDF v5/v6 per MQTT Sicuro (MbedTLS)
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker = {
+            .address.uri = AWS_IOT_ENDPOINT,
+            .address.port = 8883, // La porta standard per MQTT over TLS
+            .verification.certificate = (const char *)AWS_CERT_CA
+        },
+        .credentials = {
+            .authentication = {
+                .certificate = (const char *)AWS_CERT_CRT,
+                .key = (const char *)AWS_CERT_PRIVATE
+            }
+        }
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_start(mqtt_client);
+    
+    ESP_LOGI(TAG, "Client MQTT AWS avviato!");
+}
+
+void vMQTTPublishTask(void *args) {
+    audio_data_t data_to_send;
+    char json_payload[128];
+
+    // Aspettiamo un attimo che il Wi-Fi e MQTT si assestino
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    for(;;) {
+        // Aspetta senza consumare CPU finché la FFT non produce un nuovo risultato
+        if (xQueueReceive(mqtt_queue, &data_to_send, portMAX_DELAY) == pdTRUE) {
+            
+            // Creiamo il pacchetto JSON (uguale a quello che faresti in Arduino)
+            snprintf(json_payload, sizeof(json_payload), 
+                     "{\"dom_freq\":%.2f, \"high_freq\":%.2f, \"power\":%.0f}", 
+                     data_to_send.dominant_freq, data_to_send.highest_freq, data_to_send.max_power);
+            
+            // Invio ad AWS IoT Core (Topic: esp32/pub, QoS: 0, Retain: 0)
+            if (mqtt_client != NULL) {
+                esp_mqtt_client_publish(mqtt_client, "esp32/pub", json_payload, 0, 0, 0);
+                ESP_LOGI("AWS_MQTT", "Pubblicato: %s", json_payload);
+            }
+        }
+    }
+}
+
 void app_main(void) {
-    //init_uart();
+    
+    esp_err_t err_ret = nvs_flash_init();
+    if (err_ret == ESP_ERR_NVS_NO_FREE_PAGES || err_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err_ret);
+
     init_adc_oneshot();
     init_fft(NUM_SAMPLES);
 
-    /* xAnalogValue = xQueueCreate(1, sizeof(int16_t)); // A queue that will simulate the current analog value
-    if (xAnalogValue == NULL) {
-        ESP_LOGE(TAG, "SETUP: failed to create queue for analog values\n");
-        
-        for(;;) {
-            vTaskDelay(portMAX_DELAY);
-        }
-    }*/
+    wifi_init_sta();
+    sync_time();
+    aws_iot_mqtt_init();
+
+    mqtt_queue = xQueueCreate(10, sizeof(audio_data_t));
 
     BaseType_t ret;
 
@@ -172,10 +340,16 @@ void app_main(void) {
         ESP_LOGE(TAG, "SETUP: <Impossibile creare il task Sampler>\n");
     }
 
-    ret = xTaskCreatePinnedToCore(vFFTTask, "FFT", 8192, NULL, 5, &xFFTTaskHandle, 1);
+    ret = xTaskCreatePinnedToCore(vFFTTask, "FFT", 8192, NULL, 5, &xFFTTaskHandle, 0);
 
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "SETUP: <Impossibile creare il task FFT>\n");
+    }
+
+    ret = xTaskCreatePinnedToCore(vMQTTPublishTask, "MQTTPublish", 4096, NULL, 5, NULL, 0);
+
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "SETUP: <Impossibile creare il task MQTTPublish>\n");
     }
 
 }
