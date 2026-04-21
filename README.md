@@ -48,4 +48,60 @@ to prevent data loss and to get a good reconstruction of the signal.
 
 ![FFT Task Screenshot](assets/FFT_task_screen.png)
 
+### Window aggregation
+
+Samples are submitted either to the _FFT Task_ and the _Aggregator Task_.
+
+The _Aggregator Task_ computes the average of the samples over a window of $1024$ samples.
+
+Finally data is passed to the _MQTT Task_ which goal is to transmit data to the __AWS IoT Core MQTT__ through Wi-Fi.
+
+### MQTT
+
+Aggregated data transmitted contains:
+
+1. `average`: the average value of the window.
+2. `execution_time`: total time passed to sample the whole window.
+3. `sampled_freq`: the sample frequency of the window.
+4. `sample_number`: number of samples contained in the window.
+
+## Evaluations
+
+### Oversampling vs Adaptive
+
+### Per-Window Execution Time
+
+Per window execution time is measured at sampling time.
+
+### Data Volume
+
+Aggregating data and adaptive sampling reduce consistently data volume.
+
+![agg data struct](assets/agg_data_struct.png)
+
+Data transmitted are contained in this struct that is transmitted between pseudo-costant time.
+
+The code starts the sampling task every $10\mu s$ but most of the time is used in sampling the window.
+
+#### Example
+
+For a $50Hz$ signal the code will sample at $250Hz$.
+
+Assuming $N\_SAMPLES = 1024$:
+
+$$ sampling\_time = (1 / 250)s * 1024 = 4.096$$
+
+As we can calculate, the code will have an execution time of nearly $4s$, so:
+
+$$ data\_struct = 128 bit$$
+$$ bit\_per\_s = 128 bit / 4 s = 32 bit/s$$
+
+Instead of sending every single sample ($32bit$) that would take:
+
+$$ {32bit*sample\_frequency} = 32bit * 250*{1/s} = 8000 {bit/s}$$
+
+So aggregating data will make us send only $0.4\%$ of volume with respect to the original oversampling code.
+
+![MQTT Data](assets/MQTT_screen.png)
+
 ## Bonuses

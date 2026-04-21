@@ -347,14 +347,11 @@ void vMQTTPublishTask(void *args) {
     aggregated_data_t data_to_send;
     char json_payload[128];
 
-    // Aspettiamo un attimo che il Wi-Fi e MQTT si assestino
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     for(;;) {
-        // Aspetta senza consumare CPU finché la FFT non produce un nuovo risultato
         if (xQueueReceive(mqtt_queue, &data_to_send, portMAX_DELAY) == pdTRUE) {
             
-            // Creiamo il pacchetto JSON (uguale a quello che faresti in Arduino)
             snprintf(json_payload, sizeof(json_payload), 
                      "{\"average\":%.2f, \"execution_time\":%.2f, \"sampled_freq\":%.2f, \"sample_number\":%d}", 
                      data_to_send.average, data_to_send.execution_time, data_to_send.sampled_freq, data_to_send.sample_number);
@@ -386,7 +383,7 @@ void app_main(void) {
         sync_time();
         aws_iot_mqtt_init();
 
-        mqtt_queue = xQueueCreate(10, sizeof(audio_data_t));
+        mqtt_queue = xQueueCreate(10, sizeof(aggregated_data_t));
 
         data_queue = xQueueCreate(1, sizeof(sample_data_t));
 
