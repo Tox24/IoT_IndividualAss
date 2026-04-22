@@ -5,7 +5,9 @@
 #include "esp_log.h"
 #include "esp_adc/adc_continuous.h"
 #include "esp_adc/adc_oneshot.h"
-#include "fft_calc.h"
+extern "C" {
+    #include "fft_calc.h"
+}
 #include "esp_timer.h"
 #include "secrets.h"
 #include "nvs_flash.h"
