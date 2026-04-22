@@ -102,7 +102,7 @@ void vAdaptiveAnalogSamplerTask(void *args) {
         execution_time = end_time - start_time;
         sampled_freq = (S_TO_muS * NUM_SAMPLES) / (float)(end_time - start_time);
         
-        ESP_LOGI(TAG, "<Sampler> Sampling frequency: %.2f Hz\nExecution time: %" PRIu64 " us\n", sampled_freq, execution_time);
+        //ESP_LOGI(TAG, "<Sampler> Sampling frequency: %.2f Hz\nExecution time: %" PRIu64 " us\n", sampled_freq, execution_time);
 
         taskENTER_CRITICAL(&g_data_mux);
         for (int i = 0; i < NUM_SAMPLES; i++) {
@@ -132,7 +132,7 @@ void vAggregatorTask(void *args) {
     for(;;) {
         xQueueReceive(data_queue, &rcv_data, portMAX_DELAY);
         
-        ESP_LOGI(TAG, "<Aggregator> Received data\n");
+        //ESP_LOGI(TAG, "<Aggregator> Received data\n");
 
         for (int i = 0; i < NUM_SAMPLES; i++) {
             avg += rcv_data.samples[i];
@@ -154,21 +154,20 @@ void vAggregatorTask(void *args) {
 
 void vFastSampler(void *args) {
     uint64_t start_time = esp_timer_get_time();
+    int raw_value = 0;
 
     int i = 0;
     while (esp_timer_get_time() - start_time < 1000000) {
-        int raw_value;
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
         i++;
     }
     uint64_t execution_time = esp_timer_get_time() - start_time;
 
-    ESP_LOGI(TAG, "<FastSampler> Completed Operation in: %" PRIu64 " us\nSample number: %d\nAverage frequency: %.2f Hz", execution_time, i, (float) i * 1000000.0f / (float) execution_time);
+    //ESP_LOGI(TAG, "<FastSampler> Completed Operation in: %" PRIu64 " us\nSample number: %d\nAverage frequency: %.2f Hz", execution_time, i, (float) i * 1000000.0f / (float) execution_time);
 
     uint64_t sample_time[100];
     for (int j = 0; j < 100; j++) {
         uint64_t start_sample_time = esp_timer_get_time();
-        int raw_value;
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
         sample_time[j] = esp_timer_get_time() - start_sample_time;
     }
@@ -179,9 +178,17 @@ void vFastSampler(void *args) {
     }
     avg_oneshot_time /= 100;
 
-    ESP_LOGI(TAG, "<FastSampler> Average time per adc_oneshot_read: %" PRIu64 " us\n", avg_oneshot_time);
+    //ESP_LOGI(TAG, "<FastSampler> Average time per adc_oneshot_read: %" PRIu64 " us\n", avg_oneshot_time);
 
-    for(;;) {vTaskDelay(pdMS_TO_TICKS(1000));}
+    int h = 0;
+    for(;;) {
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw_value));
+
+        if (h % 1000 == 0) {
+            vTaskDelay(10);
+        }
+        h++;
+    }
 }
 
 void vFFTTask(void *args) {
@@ -201,8 +208,8 @@ void vFFTTask(void *args) {
 
         float ret = process_fft(local_samples, NUM_SAMPLES, local_sample_rate, &max_power, &highest_freq);
 
-        ESP_LOGI(TAG, "<FFT> Max Power on frequency: %.2f Hz\n",ret);
-        ESP_LOGI(TAG, "<FFT> Highest Frequency: %.2f Hz\n",highest_freq);
+        //ESP_LOGI(TAG, "<FFT> Max Power on frequency: %.2f Hz\n",ret);
+        //ESP_LOGI(TAG, "<FFT> Highest Frequency: %.2f Hz\n",highest_freq);
 
         float new_sample_freq = highest_freq * 5.0f;
 
@@ -218,7 +225,7 @@ void vFFTTask(void *args) {
         sample_freq = new_sample_freq;
         taskEXIT_CRITICAL(&g_data_mux);
 
-        ESP_LOGI(TAG, "Adattamento frequenza di campionamento a: %.2f Hz\n", new_sample_freq);
+        //ESP_LOGI(TAG, "Adattamento frequenza di campionamento a: %.2f Hz\n", new_sample_freq);
         
     }
 }
@@ -235,11 +242,11 @@ void init_adc_oneshot() {
     config.atten = ADC_ATTEN_DB_12;
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &config));
     
-    ESP_LOGI(TAG, "ADC OneShot Inizializzato");
+    //ESP_LOGI(TAG, "ADC OneShot Inizializzato");
 }
 
 static void sync_time(void) {
-    ESP_LOGI(TAG, "Inizializzazione SNTP. Sincronizzazione orario in corso...");
+    //ESP_LOGI(TAG, "Inizializzazione SNTP. Sincronizzazione orario in corso...");
     
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org"); // Server mondiale del tempo
@@ -250,7 +257,7 @@ static void sync_time(void) {
     
     // Aspettiamo finché l'orologio non si aggiorna (massimo 30 secondi)
     while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
-        ESP_LOGI(TAG, "In attesa della rete e dell'orario... (%d/%d)", retry, retry_count);
+        //ESP_LOGI(TAG, "In attesa della rete e dell'orario... (%d/%d)", retry, retry_count);
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
     
@@ -259,7 +266,7 @@ static void sync_time(void) {
     struct tm timeinfo;
     time(&now);
     localtime_r(&now, &timeinfo);
-    ESP_LOGI(TAG, "Orario sincronizzato con successo: %s", asctime(&timeinfo));
+    //ESP_LOGI(TAG, "Orario sincronizzato con successo: %s", asctime(&timeinfo));
 }
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -269,13 +276,13 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
         if (s_retry_num < 10) { 
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGW(TAG, "Ritento la connessione al Wi-Fi... (%d/10)", s_retry_num);
+            //ESP_LOGW(TAG, "Ritento la connessione al Wi-Fi... (%d/10)", s_retry_num);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "SUCCESSO! Indirizzo IP ottenuto: " IPSTR, IP2STR(&event->ip_info.ip));
+        //ESP_LOGI(TAG, "SUCCESSO! Indirizzo IP ottenuto: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -305,15 +312,15 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     
-    ESP_LOGI(TAG, "Attendiamo che il router ci dia un IP VERO...");
+    //ESP_LOGI(TAG, "Attendiamo che il router ci dia un IP VERO...");
 
     // Si blocca qui e aspetta l'IP VERO
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Wi-Fi connesso con successo, passiamo al cloud!");
+        //ESP_LOGI(TAG, "Wi-Fi connesso con successo, passiamo al cloud!");
     } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "Impossibile connettersi al Wi-Fi. Fermo tutto!");
+        //ESP_LOGE(TAG, "Impossibile connettersi al Wi-Fi. Fermo tutto!");
         vTaskSuspend(NULL); // Congela la scheda se il Wi-Fi non va
     }
 }
@@ -332,7 +339,7 @@ static void aws_iot_mqtt_init(void) {
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_start(mqtt_client);
     
-    ESP_LOGI(TAG, "Client MQTT AWS avviato!");
+    //ESP_LOGI(TAG, "Client MQTT AWS avviato!");
 }
 
 void vMQTTPublishTask(void *args) {
@@ -350,7 +357,7 @@ void vMQTTPublishTask(void *args) {
             
             if (mqtt_client != NULL) {
                 esp_mqtt_client_publish(mqtt_client, "esp32/data", json_payload, 0, 0, 0);
-                ESP_LOGI("AWS_MQTT", "Pubblicato: %s", json_payload);
+                //ESP_LOGI("AWS_MQTT", "Pubblicato: %s", json_payload);
             }
         }
     }
@@ -363,7 +370,7 @@ extern "C" void app_main(void) {
     init_adc_oneshot();
 
     if (MODE == DEMO) {
-        esp_err_t err_ret = nvs_flash_init();
+        /*esp_err_t err_ret = nvs_flash_init();
         if (err_ret == ESP_ERR_NVS_NO_FREE_PAGES || err_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
             ESP_ERROR_CHECK(nvs_flash_erase());
             err_ret = nvs_flash_init();
@@ -374,7 +381,7 @@ extern "C" void app_main(void) {
 
         wifi_init_sta();
         sync_time();
-        aws_iot_mqtt_init();
+        aws_iot_mqtt_init();*/
 
         mqtt_queue = xQueueCreate(10, sizeof(aggregated_data_t));
 
@@ -383,36 +390,36 @@ extern "C" void app_main(void) {
         ret = xTaskCreatePinnedToCore(vAdaptiveAnalogSamplerTask, "Sampler", 4096, NULL, 5, NULL, 1);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Error on starting Sampler task>\n");
+            //ESP_LOGE(TAG, "SETUP: <Error on starting Sampler task>\n");
         }
 
         ret = xTaskCreatePinnedToCore(vFFTTask, "FFT", 8192, NULL, 5, &xFFTTaskHandle, 0);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Error on starting FFT task>\n");
+            //ESP_LOGE(TAG, "SETUP: <Error on starting FFT task>\n");
         }
 
         ret = xTaskCreatePinnedToCore(vAggregatorTask, "Aggregator", 8192, NULL, 5, &xAggregatorTaskHandle, 0);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Error on starting Aggregator task>\n");
+            //ESP_LOGE(TAG, "SETUP: <Error on starting Aggregator task>\n");
         }
 
-        ret = xTaskCreatePinnedToCore(vMQTTPublishTask, "MQTTPublish", 4096, NULL, 5, NULL, 0);
+        //ret = xTaskCreatePinnedToCore(vMQTTPublishTask, "MQTTPublish", 4096, NULL, 5, NULL, 0);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Error on starting MQTTPublish task>\n");
+            //ESP_LOGE(TAG, "SETUP: <Error on starting MQTTPublish task>\n");
         }
 
     }
 
     else if (MODE == FAST_SAMPLER) {
-        ESP_LOGI(TAG, "<SETUP>: Starting FastSampler Task for testing ADC performance");
+        //ESP_LOGI(TAG, "<SETUP>: Starting FastSampler Task for testing ADC performance");
 
         ret = xTaskCreatePinnedToCore(vFastSampler, "FastSampler", 4096, NULL, 1, NULL, 1);
 
         if (ret != pdPASS) {
-            ESP_LOGE(TAG, "SETUP: <Error on starting FastSampler task>\n");
+            //ESP_LOGE(TAG, "SETUP: <Error on starting FastSampler task>\n");
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));

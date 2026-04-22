@@ -6,6 +6,10 @@ This file contains the documentation of the process to complete the assignment f
 
 The file contains all the requested points or at least the one i have been able to complete.
 
+## Assumptions
+
+The whole measuring was effettuated taking as input signal a $50Hz$ sinusoid.
+
 ## Assignment
 
 ### Maximum Sampling Frequency
@@ -104,4 +108,34 @@ So aggregating data will make us send only $0.4\%$ of volume with respect to the
 
 ![MQTT Data](assets/MQTT_screen.png)
 
+### Energy Consumption
+
+I measured the consuption of the esp while sampling at $18kHz$.
+
+![18k esp](assets/energy_cons_fast.png)
+
+Then if we look at the measuring of the adaptive sampler.
+
+![adapt esp](assets/adaptive_cons.png)
+
+We can compute that:
+
+$$38.87mA / 43.34mA = 0.8968$$
+
+So the adaptive sampler will consume $10\%$ less then the fast sampler.
+
+I wan't able to measure the energy consumption of the whole code due to the fact that the my INA was not properly soldered and the esp continue restarting itself instead of working because of the energy peaks the WiFi require.
+
+![restarting esp](assets/restarting_esp.png)
+
+## Struct
+
+![struct](assets/struct.jpg)
+
 ## Bonuses
+
+### Different Signals
+
+Different signals with different frequencies should not affect the adaptive sampling.
+
+In fact if the signal is correctly oversampled in the beginning the FFT should be able to compute the maximum frequency and then set the sampling frequency with respect to the highest frequency.

@@ -31,13 +31,13 @@ static void release_fft_buffers(void) {
 
 void init_fft(int FFT_SAMPLES) {
     if (!is_power_of_two(FFT_SAMPLES)) {
-        ESP_LOGE(TAG, "FFT_SAMPLES deve essere una potenza di 2 (valore: %d)", FFT_SAMPLES);
+        //ESP_LOGE(TAG, "FFT_SAMPLES deve essere una potenza di 2 (valore: %d)", FFT_SAMPLES);
         return;
     }
 
     esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Errore inizializzazione FFT");
+        //ESP_LOGE(TAG, "Errore inizializzazione FFT");
         return;
     }
 
@@ -49,7 +49,7 @@ void init_fft(int FFT_SAMPLES) {
         hanning_window = (float *)malloc((size_t)FFT_SAMPLES * sizeof(float));
     }
     if (!hanning_window) {
-        ESP_LOGE(TAG, "Errore nell'allocazione della finestra di Hanning");
+        //ESP_LOGE(TAG, "Errore nell'allocazione della finestra di Hanning");
         release_fft_buffers();
         return;
     }
@@ -59,7 +59,7 @@ void init_fft(int FFT_SAMPLES) {
         fft_data = (float *)malloc((size_t)FFT_SAMPLES * 2U * sizeof(float));
     }
     if (!fft_data) {
-        ESP_LOGE(TAG, "Errore nell'allocazione dei dati FFT");
+        //ESP_LOGE(TAG, "Errore nell'allocazione dei dati FFT");
         release_fft_buffers();
         return;
     }
@@ -67,7 +67,7 @@ void init_fft(int FFT_SAMPLES) {
     fft_size = FFT_SAMPLES;
     fft_ready = true;
 
-    ESP_LOGI(TAG, "Modulo FFT pronto (%d campioni)", FFT_SAMPLES);
+    //ESP_LOGI(TAG, "Modulo FFT pronto (%d campioni)", FFT_SAMPLES);
 }
 
 
@@ -80,12 +80,12 @@ float process_fft(int *samples, int FFT_SAMPLES, float current_sample_rate, floa
     }
 
     if (!samples || current_sample_rate <= 0.0f || FFT_SAMPLES <= 0 || !is_power_of_two(FFT_SAMPLES)) {
-        ESP_LOGE(TAG, "Parametri FFT non validi");
+        //ESP_LOGE(TAG, "Parametri FFT non validi");
         return 0.0f;
     }
 
     if (!fft_ready || fft_size != FFT_SAMPLES || !fft_data || !hanning_window) {
-        ESP_LOGE(TAG, "FFT non inizializzata o dimensione incoerente. Richiesto init_fft(%d)", FFT_SAMPLES);
+        //ESP_LOGE(TAG, "FFT non inizializzata o dimensione incoerente. Richiesto init_fft(%d)", FFT_SAMPLES);
         return 0.0f;
     }
 
